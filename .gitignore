@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.py.class
+*.egg-info/
+*.egg
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code internal
+.claude/
+.agents/
+skills-lock.json
+
+# Model files are tracked by Git LFS (.gitattributes)
+# DO NOT add *.onnx / *.pth / *.pt here — LFS needs them tracked
