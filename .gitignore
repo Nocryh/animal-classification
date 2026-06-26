@@ -23,10 +23,18 @@ env/
 .DS_Store
 Thumbs.db
 
+# Model files (managed by Git LFS)
+*.onnx
+*.pth
+*.pt
+
+# Experiments (large outputs)
+experiments/
+
 # Claude Code internal
 .claude/
 .agents/
 skills-lock.json
 
-# Model files are tracked by Git LFS (.gitattributes)
-# DO NOT add *.onnx / *.pth / *.pt here — LFS needs them tracked
+# Optuna
+*.db

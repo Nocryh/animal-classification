@@ -1,0 +1,82 @@
+# =============================================================================
+# Animal Classification — Default Training Configuration
+# =============================================================================
+# 所有超参数集中管理，训练脚本不写死任何常量
+# 命令行覆盖: python train.py --config config/default.yaml --override model=convnext
+
+data:
+  data_dir: "./data/animals"        # ImageFolder 格式数据集路径
+  classes_file: "./data/classes.txt" # 类别名称文件（每行一个）
+  img_size: 224
+  num_classes: 90
+  val_split: 0.2
+  test_split: 0.0                   # 0 = 不使用独立测试集，仅用 val
+  num_workers: 2
+  pin_memory: true
+
+model:
+  architecture: "resnet50"          # resnet50 | efficientnetv2_s | convnext_tiny
+  pretrained: true
+  dropout: 0.3
+  pool: "gem"                       # avg | gem (Generalized Mean Pooling)
+
+training:
+  batch_size: 32
+  epochs: 80
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  optimizer: "adamw"                # adamw | sgd
+  momentum: 0.9                     # only for SGD
+  gradient_clip_norm: 1.0
+  mixed_precision: true             # Automatic Mixed Precision (AMP)
+
+loss:
+  type: "combined"                  # cross_entropy | focal | label_smoothing | combined
+  focal_gamma: 2.0
+  focal_alpha: null                 # null = auto-compute from class distribution
+  label_smoothing: 0.1
+  class_weights: null               # null = auto-compute balanced weights
+
+scheduler:
+  type: "cosine_warmup"            # cosine | cosine_warmup | plateau | onecycle
+  warmup_epochs: 5
+  warmup_start_lr: 1.0e-6
+  lr_min: 1.0e-6
+  patience: 10                      # for ReduceLROnPlateau only
+
+augmentation:
+  # RandAugment parameters
+  randaugment: true
+  ra_num_ops: 2                     # number of augmentation operations
+  ra_magnitude: 9                   # 1-15, higher = stronger
+  # MixUp
+  mixup: true
+  mixup_alpha: 0.2
+  # CutMix
+  cutmix: false
+  cutmix_alpha: 1.0
+  # Standard augmentations (used if randaugment=false)
+  random_crop_scale: [0.6, 1.0]
+  random_horizontal_flip: 0.5
+  random_rotation: 20
+  color_jitter: [0.2, 0.2, 0.2, 0.1]
+
+early_stopping:
+  enabled: true
+  monitor: "val_loss"               # val_loss | val_acc
+  patience: 15
+  min_delta: 0.001
+
+checkpoint:
+  save_top_k: 3                     # keep top-K best checkpoints
+  save_every_n_epochs: 10           # periodic backup
+  resume: false                     # resume from latest checkpoint
+  resume_path: null
+
+experiment:
+  name: "baseline"                  # experiment name (auto-appended with timestamp)
+  seed: 42
+  log_interval: 50                  # log every N batches to TensorBoard
+
+device:
+  gpu_id: 0                         # single GPU; set to -1 for CPU
