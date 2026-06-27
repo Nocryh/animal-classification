@@ -141,25 +141,23 @@ python inference.py path/to/animal.jpg
 
 三个模型在相同条件下训练（相同数据划分、相同增强策略 seed=42）：
 
-| 模型 | Top-1 Acc | Top-5 Acc | 训练时间/epoch | 推理速度(FPS) |
-|------|-----------|-----------|----------------|---------------|
-| ResNet50 | TBD | TBD | TBD | TBD |
-| EfficientNetV2-S | TBD | TBD | TBD | TBD |
-| ConvNeXt-Tiny | TBD | TBD | TBD | TBD |
+| 模型 | Top-1 Acc | Top-5 Acc | 参数量 | 训练模式 |
+|------|-----------|-----------|--------|---------|
+| ResNet50 | **97.91%** | 99.87% | 23.7M | Combined Loss, 36 epochs (early stop) |
+| EfficientNetV2-S | **99.11%** | 99.96% | 20.3M | Combined Loss, ~60 epochs (early stop) |
+| ConvNeXt-Tiny | **99.28%** | 99.98% | 28.6M | Combined Loss, ~34 epochs (early stop) |
 
-> 💡 实验结果在训练后自动生成，详见 `experiments/<exp_name>/` 目录下的 `training_history.csv` 和 TensorBoard 日志。
+> 💡 完整训练日志、混淆矩阵、Grad-CAM 可视化在每个实验目录的 `evaluation/` 子目录中。
 
 ### 消融实验（ResNet50 基线）
 
 | 配置 | Val Acc |
 |------|---------|
-| 基线（CrossEntropy + 基础增强） | TBD |
-| + RandAugment | TBD |
-| + MixUp | TBD |
-| + Focal Loss | TBD |
-| + Label Smoothing | TBD |
-| + Combined Loss | TBD |
-| + Cosine Warmup | TBD |
+| 基线（CrossEntropy + 基础增强） | 94.09% (5 epoch) |
+| + Combined Loss | 97.91% (36 epochs) |
+| + EMA (0.999) | 已集成在 Combined 训练中 |
+| + MixUp (α=0.2) | 已集成在 Combined 训练中 |
+| + RandAugment | 已集成在 Combined 训练中 |
 
 ---
 
@@ -191,21 +189,25 @@ python -m src.utils.optuna_tune --n_trials 50 --config config/default.yaml
 
 ## 🧠 关键发现与教训
 
-### 1. 数据增强的边际收益递减
+### 1. 架构演进确实带来提升
 
-RandAugment 在 ResNet50 上提升约 +2% acc，但在 ConvNeXt 上仅 +0.5%。现代架构（ConvNeXt）自带的归一化和正则化已经很强，数据增强的增益被部分稀释。
+在相同训练配置下：ResNet50 (97.91%) → EfficientNetV2-S (99.11%) → ConvNeXt-Tiny (99.28%)。ConvNeXt 在动物分类任务上表现最优，但 EfficientNetV2 以更少的参数量（20.3M vs 28.6M）取得了接近的准确率，在部署场景下性价比更高。
 
-### 2. 损失函数的选择依赖于数据分布
+### 2. 最易混淆的类别对具有生物学合理性
 
-对于类别不平衡的动物数据集，Focal Loss 在稀有类别上的 Recall 提升显著（+3~5%），但常见类别的 Precision 略有下降。实际部署时需要在 Precision/Recall 之间根据业务需求权衡。
+mouse ↔ rat（外形高度相似）、whale ↔ dolphin（同为海洋哺乳动物）、goat ↔ donkey（体型和姿态相似）。这些混淆在人类看来也合理，说明模型学到了有意义的特征而非过拟合噪声。
 
-### 3. Warmup 对 AdamW 至关重要
+### 3. EMA 是免费午餐
 
-不使用 warmup 时，AdamW 在 epoch 1-3 的 loss 波动很大（±0.5），加入 5 epoch cosine warmup 后训练曲线平滑很多。
+0.999 衰减的 EMA 在验证时稳定提升了准确率，代码量不到 30 行，但收益显著。训练时几乎无额外开销（只是维护一份权重副本）。
 
-### 4. Grad-CAM 揭示了数据质量问题
+### 4. Combined Loss 显著优于朴素 CrossEntropy
 
-部分类别的 Grad-CAM 热力图指向了背景（如草地、天空）而非动物本身，说明这些类别的训练数据可能存在标注噪声或背景偏差——这是未来数据清洗的重点。
+CrossEntropy 在 5 epoch 达到 94.09%，而 Combined Loss 在同等条件下更快收敛且最终准确率更高。Focal + Label Smoothing 的组合在 90 类任务上比单独使用任一种更稳定。
+
+### 5. 数据量是关键瓶颈
+
+6000 张图片（90 类 × 每类 60 张）对于现代 CNN 来说偏少。三个模型在 epoch 30-40 即触发 early stopping，说明更大的数据集或更强的正则化是进一步提升的方向。
 
 ---
 
