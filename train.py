@@ -23,7 +23,7 @@ import torch
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, PROJECT_ROOT)
 
-from src.data.dataset import create_dataloaders
+from src.data.dataset import create_dataloaders, validate_dataset
 from src.data.augmentations import get_train_transforms, get_val_transforms
 from src.models.factory import create_model, benchmark_inference_speed
 from src.training.trainer import Trainer
@@ -122,6 +122,14 @@ def main():
         f"cuda:{gpu_id}" if gpu_id >= 0 and torch.cuda.is_available() else "cpu"
     )
     print(f"Device: {device}")
+
+    # 数据完整性扫描（训练前检查，避免中途崩溃）
+    print("Scanning dataset for corrupt files...")
+    data_report = validate_dataset(config["data"]["data_dir"], img_size=config["data"]["img_size"])
+    if data_report["corrupt"] > 0:
+        print(f"Warning: {data_report['corrupt']} corrupt files detected. "
+              f"Consider removing them before training.")
+    print()
 
     # 数据
     img_size = config["data"]["img_size"]

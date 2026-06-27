@@ -119,7 +119,22 @@ RANDAUGMENT_OPS = [
 ]
 
 
-def apply_randaugment(img, num_ops: int = 2, magnitude: int = 9):
+class RandAugment:
+    """
+    RandAugment 变换（可 pickle，兼容 Windows multiprocessing）。
+
+    参考: RandAugment: Practical automated data augmentation (Cubuk et al., 2020)
+    """
+
+    def __init__(self, num_ops: int = 2, magnitude: int = 9):
+        self.num_ops = num_ops
+        self.magnitude = magnitude
+
+    def __call__(self, img):
+        return _apply_randaugment(img, self.num_ops, self.magnitude)
+
+
+def _apply_randaugment(img, num_ops: int = 2, magnitude: int = 9):
     """
     应用 RandAugment。
 
@@ -216,12 +231,9 @@ def get_train_transforms(img_size: int = 224, config: dict = None):
 
     # RandAugment
     if config.get("randaugment", True):
-        pipeline.append(transforms.Lambda(
-            lambda img: apply_randaugment(
-                img,
-                num_ops=config.get("ra_num_ops", 2),
-                magnitude=config.get("ra_magnitude", 9)
-            )
+        pipeline.append(RandAugment(
+            num_ops=config.get("ra_num_ops", 2),
+            magnitude=config.get("ra_magnitude", 9),
         ))
     else:
         # 回退到传统增强

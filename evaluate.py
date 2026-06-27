@@ -55,6 +55,9 @@ def parse_args():
                         help="Output directory for results")
     parser.add_argument("--num_gradcam", type=int, default=20,
                         help="Number of Grad-CAM samples to generate")
+    parser.add_argument("--model", type=str, default=None,
+                        choices=["resnet50", "efficientnetv2_s", "convnext_tiny"],
+                        help="Model architecture (auto-detect from experiment config if not set)")
     parser.add_argument("--device", type=str, default="cuda",
                         help="Device (cuda / cpu)")
     return parser.parse_args()
@@ -93,21 +96,33 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
     print(f"Output: {output_dir}\n")
 
+    # 自动检测架构：优先用命令行参数，其次用实验配置快照，最后用基础配置
+    architecture = args.model
+    if architecture is None:
+        exp_dir = os.path.dirname(args.checkpoint)
+        exp_config_path = os.path.join(exp_dir, "config.yaml")
+        if os.path.exists(exp_config_path):
+            with open(exp_config_path, "r", encoding="utf-8") as f:
+                exp_config = yaml.safe_load(f)
+            architecture = exp_config.get("model", {}).get("architecture", "resnet50")
+        else:
+            architecture = config["model"].get("architecture", "resnet50")
+
+    print(f"Architecture: {architecture} (auto-detected)")
+
     # 模型
-    model_cfg = config["model"]
     model, model_info = create_model(
-        architecture=model_cfg.get("architecture", "resnet50"),
+        architecture=architecture,
         num_classes=config["data"]["num_classes"],
-        pretrained=False,  # 加载 checkpoint，不需要 pretrained
-        dropout=model_cfg.get("dropout", 0.3),
-        pool_type=model_cfg.get("pool", "gem"),
+        pretrained=False,
+        dropout=config["model"].get("dropout", 0.3),
+        pool_type=config["model"].get("pool", "gem"),
     )
     model = load_checkpoint(model, args.checkpoint, device)
     model = model.to(device)
     model.eval()
 
-    num_params = model_info["params_millions"]
-    print(f"Model: {model_info['architecture']} ({num_params}M params)")
+    print(f"Model: {architecture} ({model_info['params_millions']}M params)")
 
     # 数据
     data_dir = args.data_dir or config["data"]["data_dir"]
@@ -123,19 +138,27 @@ def main():
     print(f"Evaluation samples: {len(eval_dataset)}")
     print(f"Classes: {len(class_names)}\n")
 
+    # ==================== 一次性预测（避免重复前向传播）====================
+    need_features = args.mode in ("full", "tsne")
+    print(f"Running inference on {len(eval_dataset)} images"
+          f"{' (with feature extraction)' if need_features else ''}...")
+
+    results = predict_dataset(model, eval_loader, device, return_features=need_features)
+
+    predictions = results["predictions"]
+    labels_arr = results["labels"]
+    probabilities = results["probabilities"]
+    features_arr = results.get("features")
+
+    print(f"Done. Predictions shape: {predictions.shape}\n")
+
     # ==================== Metrics ====================
-    if args.mode in ["full", "metrics"]:
+    if args.mode in ("full", "metrics"):
         print(f"{'=' * 60}")
         print("METRICS EVALUATION")
         print(f"{'=' * 60}")
 
-        results = predict_dataset(
-            model, eval_loader, device, return_features=(args.mode in ["full", "tsne"])
-        )
-
-        metrics = compute_metrics(
-            results["predictions"], results["labels"], class_names
-        )
+        metrics = compute_metrics(predictions, labels_arr, class_names)
 
         print(f"Top-1 Accuracy: {metrics['top1_accuracy']:.2%}")
         print(f"Macro Avg: P={metrics['macro_avg']['precision']:.4f} | "
@@ -164,7 +187,7 @@ def main():
             f.write(metrics["classification_report"])
         print(f"  Saved: {report_path}")
 
-        # 错误分析
+        # 混淆对
         confusion_pairs = analyze_confusion_pairs(
             metrics["confusion_matrix"], class_names, top_k=10
         )
@@ -173,7 +196,7 @@ def main():
             print(f"  {i}. {pair['true_class']} → {pair['pred_class']} "
                   f"({pair['count']} times)")
 
-        # 完整的每类指标
+        # 最差类别
         print("\nPer-Class Metrics (worst 5 by F1):")
         worst = sorted(metrics["per_class"], key=lambda x: x["f1"])[:5]
         for d in worst:
@@ -181,8 +204,8 @@ def main():
                   f"P={d['precision']:.4f} R={d['recall']:.4f} "
                   f"sup={d['support']}")
 
-    # ==================== Grad-CAM ====================
-    if args.mode in ["full", "gradcam"]:
+    # ==================== Grad-CAM（复用 predictions）====================
+    if args.mode in ("full", "gradcam"):
         print(f"\n{'=' * 60}")
         print("GRAD-CAM EXPLANATIONS")
         print(f"{'=' * 60}")
@@ -190,88 +213,88 @@ def main():
         gradcam_dir = os.path.join(output_dir, "gradcam")
         os.makedirs(gradcam_dir, exist_ok=True)
 
-        # 选择样本：各类别各取 1 个 + 误分类样本
-        correct_samples = []
-        wrong_samples = []
+        # 从已预测的结果中选样本，避免重新前向传播
+        correct_mask = predictions == labels_arr
+        wrong_mask = ~correct_mask
 
-        for images, labels in eval_loader:
-            images = images.to(device)
-            outputs = model(images)
-            preds = outputs.argmax(dim=1)
+        correct_indices = np.where(correct_mask)[0]
+        wrong_indices = np.where(wrong_mask)[0]
 
+        n_correct = min(args.num_gradcam // 2, len(correct_indices))
+        n_wrong = min(args.num_gradcam // 2, len(wrong_indices))
+
+        selected_correct = np.random.choice(correct_indices, n_correct, replace=False) if n_correct > 0 else []
+        selected_wrong = np.random.choice(wrong_indices, n_wrong, replace=False) if n_wrong > 0 else []
+
+        # 需要从 dataloader 中取对应索引的原始图像
+        # 构建索引集合用于快速查找
+        selected_set = set(selected_correct.tolist() + selected_wrong.tolist())
+        sample_images = {}  # global_index -> image_tensor
+
+        current_idx = 0
+        for images, _ in eval_loader:
             for i in range(len(images)):
-                is_correct = preds[i] == labels[i]
-                if is_correct and len(correct_samples) < args.num_gradcam // 2:
-                    correct_samples.append((images[i:i+1], labels[i].item(), preds[i].item(),
-                                           outputs.softmax(1)[i, preds[i]].item()))
-                elif not is_correct and len(wrong_samples) < args.num_gradcam // 2:
-                    wrong_samples.append((images[i:i+1], labels[i].item(), preds[i].item(),
-                                         outputs.softmax(1)[i, preds[i]].item()))
-
-                if len(correct_samples) >= args.num_gradcam // 2 and \
-                   len(wrong_samples) >= args.num_gradcam // 2:
-                    break
+                if current_idx in selected_set:
+                    sample_images[current_idx] = images[i].to(device)
+                    if len(sample_images) >= len(selected_set):
+                        break
+                current_idx += 1
+            if len(sample_images) >= len(selected_set):
+                break
 
         # 生成 Grad-CAM
-        for sample_type, samples in [("correct", correct_samples), ("wrong", wrong_samples)]:
+        for sample_type, indices in [("correct", selected_correct), ("wrong", selected_wrong)]:
             sample_dir = os.path.join(gradcam_dir, sample_type)
-            for j, (img_tensor, true_label, pred_label, conf) in enumerate(samples):
-                # 反标准化用于显示
+            for j, idx in enumerate(indices):
+                img_tensor = sample_images.get(idx)
+                if img_tensor is None:
+                    continue
+
+                img_tensor = img_tensor.unsqueeze(0)  # (1, C, H, W)
+                true_label = labels_arr[idx]
+                pred_label = predictions[idx]
+                conf = probabilities[idx, pred_label]
+
                 from src.evaluation.explainability import denormalize
                 denorm = denormalize(img_tensor.cpu()).squeeze().permute(1, 2, 0).numpy()
                 denorm = np.clip(denorm * 255, 0, 255).astype(np.uint8)
 
                 pred_name = class_names[pred_label] if pred_label < len(class_names) else str(pred_label)
                 true_name = class_names[true_label] if true_label < len(class_names) else str(true_label)
-
-                filename = f"{sample_type}_{j}_{true_name}_pred_{pred_name}.png"
+                filename = f"{sample_type}_{j:02d}_{true_name}_pred_{pred_name}.png"
 
                 generate_gradcam_explanation(
                     model, img_tensor, denorm, pred_name, conf,
                     sample_dir, filename, method="gradcam",
                 )
 
-        print(f"  Generated {args.num_gradcam} Grad-CAM visualizations")
+        print(f"  Generated {len(selected_correct)} correct + {len(selected_wrong)} wrong Grad-CAMs")
         print(f"  Saved: {gradcam_dir}/")
 
-    # ==================== t-SNE ====================
-    if args.mode in ["full", "tsne"]:
+    # ==================== t-SNE（复用 features）====================
+    if args.mode in ("full", "tsne"):
         print(f"\n{'=' * 60}")
         print("t-SNE FEATURE EMBEDDING")
         print(f"{'=' * 60}")
 
-        # Re-run with features if not already
-        if args.mode not in ["full", "metrics"]:
-            results = predict_dataset(
-                model, eval_loader, device, return_features=True
-            )
-        else:
-            results = predict_dataset(
-                model, eval_loader, device, return_features=True
-            )
-
-        if "features" in results and results["features"] is not None:
+        if features_arr is not None and len(features_arr) > 0:
             tsne_path = os.path.join(output_dir, "tsne_embeddings.png")
             plot_tsne_embeddings(
-                results["features"], results["labels"], class_names, tsne_path,
+                features_arr, labels_arr, class_names, tsne_path,
                 max_samples=2000,
             )
             print(f"  Saved: {tsne_path}")
         else:
-            print("  Skipped: No features available")
+            print("  Skipped: No features available (retry with --mode full or --mode tsne)")
 
-    # ==================== Error Analysis ====================
-    if args.mode in ["full", "errors"]:
+    # ==================== 错误分析（复用 predictions）====================
+    if args.mode in ("full", "errors"):
         print(f"\n{'=' * 60}")
         print("ERROR ANALYSIS")
         print(f"{'=' * 60}")
 
-        if args.mode not in ["full", "metrics"]:
-            results = predict_dataset(model, eval_loader, device)
-
         errors = find_misclassified(
-            results["predictions"], results["labels"],
-            results["probabilities"], class_names, top_k=30,
+            predictions, labels_arr, probabilities, class_names, top_k=30,
         )
 
         error_path = os.path.join(output_dir, "error_analysis.txt")

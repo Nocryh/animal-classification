@@ -15,7 +15,8 @@ def gem_pooling(x: torch.Tensor, p: float = 3.0, eps: float = 1e-6) -> torch.Ten
     比 AdaptiveAvgPool2d 更灵活，p=1 等价于平均池化，p→∞ 等价于最大池化
     """
     x = x.clamp(min=eps)
-    return nn.functional.avg_pool2d(x.pow(p), x.size()[2:]).pow(1.0 / p)
+    h, w = x.shape[2], x.shape[3]
+    return nn.functional.avg_pool2d(x.pow(p), (h, w)).pow(1.0 / p)
 
 
 class GeMPool(nn.Module):
@@ -72,26 +73,38 @@ def create_model(architecture: str = "resnet50", num_classes: int = 90,
     if architecture == "resnet50":
         model = models.resnet50(weights="IMAGENET1K_V1" if pretrained else None)
         in_features = model.fc.in_features
-        model.fc = ClassificationHead(in_features, num_classes, dropout, pool_type)
+        # avgpool + flatten 在 forward 里是硬编码的，分类头收到 2D 向量
+        model.fc = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(in_features, num_classes),
+        )
 
     elif architecture == "efficientnetv2_s":
         model = models.efficientnet_v2_s(
             weights="IMAGENET1K_V1" if pretrained else None
         )
         in_features = model.classifier[1].in_features
-        model.classifier = ClassificationHead(in_features, num_classes, dropout, pool_type)
+        # 同样有 avgpool + flatten 在前，分类头收到 2D 向量
+        model.classifier = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(in_features, num_classes),
+        )
 
     elif architecture == "convnext_tiny":
         model = models.convnext_tiny(
             weights="IMAGENET1K_V1" if pretrained else None
         )
+        # ConvNeXt classifier: [LayerNorm, Flatten, Linear]
+        # 只替换最后的 Linear 层，保持 LayerNorm 权重不变
         in_features = model.classifier[2].in_features
+        model.classifier[2] = nn.Linear(in_features, num_classes)
+        # 在 Flatten 后插入 Dropout（通过修改 forward 更简单：直接加在最后）
+        # 用 Sequential 重新包装以加入 Dropout
         model.classifier = nn.Sequential(
-            GeMPool(p=3.0),
-            nn.Flatten(),
-            nn.LayerNorm(in_features, eps=1e-6),
+            model.classifier[0],   # LayerNorm (保持预训练权重)
+            model.classifier[1],   # Flatten
             nn.Dropout(dropout),
-            nn.Linear(in_features, num_classes),
+            model.classifier[2],   # new Linear
         )
 
     else:

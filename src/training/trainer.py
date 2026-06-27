@@ -3,6 +3,7 @@
 ========
 完整的训练循环，包含：
 - 混合精度训练 (AMP)
+- EMA (指数移动平均)
 - TensorBoard 日志
 - 断点续训
 - 训练摘要报告
@@ -10,6 +11,7 @@
 import os
 import yaml
 import time
+import copy
 import numpy as np
 from datetime import datetime
 
@@ -17,12 +19,54 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.optim import lr_scheduler
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.utils.tensorboard import SummaryWriter
 
 from .losses import get_loss_function
 from .callbacks import EarlyStopping, CheckpointManager
 from ..data.augmentations import mixup_data, mixup_criterion
+
+
+class EMA:
+    """
+    指数移动平均 (Exponential Moving Average)
+
+    维护一份模型权重的滑动平均副本，不参与梯度计算。
+    验证时切换到 EMA 权重，通常带来 +0.5~1% 的稳定提升。
+
+    参考: "Averaging Weights Leads to Wider Optima and Better Generalization"
+    """
+
+    def __init__(self, model: nn.Module, decay: float = 0.999):
+        self.model = model
+        self.decay = decay
+        self.shadow = {}
+        self.backup = {}
+
+        # 初始化 shadow 为当前权重
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone()
+
+    def update(self):
+        """每步训练后调用：shadow = decay * shadow + (1 - decay) * current"""
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                new_average = self.decay * self.shadow[name] + (1.0 - self.decay) * param.data
+                self.shadow[name] = new_average
+
+    def apply_shadow(self):
+        """将 EMA 权重应用到模型（验证前调用）"""
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.backup[name] = param.data.clone()
+                param.data = self.shadow[name]
+
+    def restore(self):
+        """恢复原始训练权重（验证后调用）"""
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and name in self.backup:
+                param.data = self.backup[name]
 
 
 class Trainer:
@@ -91,7 +135,7 @@ class Trainer:
         self.writer = SummaryWriter(log_dir=self.tb_dir)
 
         # 混合精度
-        self.scaler = GradScaler() if self.mixed_precision and self.device.type == "cuda" else None
+        self.scaler = GradScaler("cuda") if self.mixed_precision and self.device.type == "cuda" else None
 
         # 日志
         self.log_interval = config.get("experiment", {}).get("log_interval", 50)
@@ -115,6 +159,11 @@ class Trainer:
         aug_cfg = config.get("augmentation", {})
         self.use_mixup = aug_cfg.get("mixup", False)
         self.mixup_alpha = aug_cfg.get("mixup_alpha", 0.2)
+
+        # EMA (指数移动平均)
+        ema_cfg = config.get("ema", {})
+        self.use_ema = ema_cfg.get("enabled", True)
+        self.ema = EMA(model, decay=ema_cfg.get("decay", 0.999)) if self.use_ema else None
 
         # 保存实验配置快照
         self._save_config_snapshot()
@@ -222,7 +271,11 @@ class Trainer:
             global_step += len(self.train_loader)
 
             # ========== Validation ==========
+            if self.ema:
+                self.ema.apply_shadow()
             val_loss, val_acc = self._validate()
+            if self.ema:
+                self.ema.restore()
 
             # ========== Scheduling ==========
             current_lr = self.optimizer.param_groups[0]["lr"]
@@ -301,6 +354,7 @@ class Trainer:
         self.model.train()
         running_loss = 0.0
         correct, total = 0, 0
+        samples_seen = 0
 
         for batch_idx, (images, labels) in enumerate(self.train_loader):
             images = images.to(self.device)
@@ -314,7 +368,7 @@ class Trainer:
 
             # 前向传播（可选混合精度）
             if self.scaler:
-                with autocast():
+                with autocast("cuda"):
                     outputs = self.model(images)
                     if self.use_mixup:
                         loss = mixup_criterion(self.criterion, outputs, labels_a, labels_b, lam)
@@ -331,7 +385,6 @@ class Trainer:
             self.optimizer.zero_grad()
             if self.scaler:
                 self.scaler.scale(loss).backward()
-                # 梯度裁剪
                 grad_clip = self.training_cfg.get("gradient_clip_norm")
                 if grad_clip:
                     self.scaler.unscale_(self.optimizer)
@@ -345,9 +398,21 @@ class Trainer:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip)
                 self.optimizer.step()
 
+            # EMA 更新
+            if self.ema:
+                self.ema.update()
+
             # 统计
             running_loss += loss.item() * images.size(0)
-            if not self.use_mixup:
+
+            # MixUp 模式下的训练准确率（近似，在混合图像上对原始标签做预测）
+            # 参考 timm/pytorch-image-models 的做法
+            if self.use_mixup:
+                _, predicted = outputs.max(1)
+                total += labels_a.size(0)
+                correct += (lam * predicted.eq(labels_a).float() +
+                            (1 - lam) * predicted.eq(labels_b).float()).sum().item()
+            else:
                 _, predicted = outputs.max(1)
                 total += labels.size(0)
                 correct += predicted.eq(labels).sum().item()
@@ -356,10 +421,6 @@ class Trainer:
             step = global_step + batch_idx
             if batch_idx % self.log_interval == 0:
                 self.writer.add_scalar("Loss/train_batch", loss.item(), step)
-
-        if self.use_mixup:
-            # MixUp 时 accuracy 需要单独计算
-            correct, total = self._compute_accuracy()
 
         train_loss = running_loss / len(self.train_loader.dataset)
         train_acc = correct / max(total, 1)
@@ -389,21 +450,6 @@ class Trainer:
         val_acc = correct / max(total, 1)
 
         return val_loss, val_acc
-
-    @torch.no_grad()
-    def _compute_accuracy(self) -> tuple:
-        """在训练集上计算准确率（用于 MixUp 模式）"""
-        self.model.eval()
-        correct, total = 0, 0
-        for images, labels in self.train_loader:
-            images = images.to(self.device)
-            labels = labels.to(self.device)
-            outputs = self.model(images)
-            _, predicted = outputs.max(1)
-            total += labels.size(0)
-            correct += predicted.eq(labels).sum().item()
-        self.model.train()
-        return correct, total
 
     def _save_training_summary(self):
         """保存训练历史为 CSV"""

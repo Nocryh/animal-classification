@@ -304,7 +304,7 @@ def plot_tsne_embeddings(features: np.ndarray, labels: np.ndarray,
 
     # t-SNE
     tsne = TSNE(n_components=2, perplexity=perplexity, random_state=42,
-                n_iter=1000)
+                max_iter=1000)
     embeddings = tsne.fit_transform(features)
 
     # 绘图
@@ -337,17 +337,58 @@ def plot_tsne_embeddings(features: np.ndarray, labels: np.ndarray,
 
 
 def _find_conv_layer(model: torch.nn.Module, target_name: str = None):
-    """查找模型中的最后一个卷积层（用于 Grad-CAM）"""
+    """
+    根据模型架构返回最适合 Grad-CAM 的目标卷积层。
+
+    Grad-CAM 需要的是最后一个空间尺寸较大（感受野适中）的卷积层，
+    不同架构的最佳位置不同：
+
+    - ResNet50:       layer4[-1].conv3  (7x7 空间)
+    - EfficientNetV2: features[-1][-1] (最后的 MBConv block)
+    - ConvNeXt:       features[-1][-1].block[-1] (最后的 Conv2d)
+    """
     if target_name:
         for name, module in model.named_modules():
             if name == target_name:
                 return module
         return None
 
-    # 自动查找：找到最后一个 Conv2d 层
+    # 按架构自动选择最佳层
+    model_type = type(model).__name__.lower()
+
+    # ResNet 系列
+    if "resnet" in model_type:
+        # layer4 的最后一个 bottleneck block 的 conv3
+        if hasattr(model, "layer4"):
+            return model.layer4[-1].conv3
+
+    # EfficientNet 系列
+    if "efficientnet" in model_type:
+        # features 最后一个 stage 的最后一个 block 中的 Conv2d
+        if hasattr(model, "features"):
+            last_stage = model.features[-1]
+            # 递归找最后的 Conv2d
+            for module in reversed(list(last_stage.modules())):
+                if isinstance(module, torch.nn.Conv2d):
+                    return module
+
+    # ConvNeXt 系列
+    if "convnext" in model_type:
+        # features[-1] 的最后一个 block 中的最后 Conv2d
+        if hasattr(model, "features"):
+            last_stage = model.features[-1]
+            if hasattr(last_stage, "block"):
+                for module in reversed(list(last_stage.block.modules())):
+                    if isinstance(module, torch.nn.Conv2d):
+                        return module
+
+    # 通用回退：找最后一个 Conv2d
     last_conv = None
-    for module in model.modules():
+    for name, module in model.named_modules():
         if isinstance(module, torch.nn.Conv2d):
             last_conv = module
+
+    if last_conv is None:
+        print("[Grad-CAM] Warning: No Conv2d layer found in model")
 
     return last_conv

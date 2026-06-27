@@ -144,12 +144,16 @@ class CheckpointManager:
 
     def save_periodic(self, model: nn.Module, optimizer, scheduler,
                       epoch: int, score: float, config: dict):
-        """定期备份"""
+        """定期备份（权重仅，轻量级）"""
         if epoch % self.save_every_n == 0:
-            return self.save_checkpoint(
-                model, optimizer, scheduler, epoch, score, config,
-                filename=f"periodic_epoch_{epoch:03d}.pt"
-            )
+            # 轻量级：只保存权重，和 best checkpoint 保持一致
+            filepath = os.path.join(self.save_dir, f"periodic_epoch_{epoch:03d}.pth")
+            torch.save({
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "score": score,
+            }, filepath)
+            return filepath
         return None
 
     def load_latest(self, model: nn.Module, optimizer, scheduler) -> int:

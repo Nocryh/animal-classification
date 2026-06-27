@@ -16,6 +16,7 @@ from sklearn.metrics import (
     precision_recall_fscore_support, accuracy_score, top_k_accuracy_score,
 )
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader
 
 

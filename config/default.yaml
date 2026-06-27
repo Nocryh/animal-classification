@@ -11,7 +11,7 @@ data:
   num_classes: 90
   val_split: 0.2
   test_split: 0.0                   # 0 = 不使用独立测试集，仅用 val
-  num_workers: 2
+  num_workers: 4                     # 数据加载线程数（Windows 上 2-4，Linux 可更大）
   pin_memory: true
 
 model:
@@ -36,6 +36,10 @@ loss:
   focal_alpha: null                 # null = auto-compute from class distribution
   label_smoothing: 0.1
   class_weights: null               # null = auto-compute balanced weights
+
+ema:
+  enabled: true
+  decay: 0.999                     # 越大越平滑 (0.999-0.9999)
 
 scheduler:
   type: "cosine_warmup"            # cosine | cosine_warmup | plateau | onecycle

@@ -3,15 +3,19 @@
 ==============
 - 从 ImageFolder 格式目录加载数据
 - 分层划分 train/val/test（保证每类样本比例一致）
-- 支持类别分布统计
+- 数据完整性验证（训练前扫描）
+- 类别分布统计
 """
 import os
+from pathlib import Path
 import numpy as np
 from collections import Counter
+import warnings
 
 import torch
 from torch.utils.data import Dataset, DataLoader, Subset
 from torchvision import datasets
+from PIL import Image
 
 
 def load_class_names(path: str) -> list:
@@ -124,3 +128,99 @@ def create_dataloaders(data_dir: str, train_transform, val_transform,
         "test_size": len(test_idx) if test_idx else 0,
         "class_distribution": class_dist,
     }
+
+
+def validate_dataset(data_dir: str, img_size: int = 224) -> dict:
+    """
+    训练前扫描数据集，检测损坏/异常文件。
+
+    检查项:
+    - 文件是否能被 PIL 正常打开
+    - 图像 mode 是否为 RGB（灰度/ RGBA 会转换）
+    - 图像尺寸是否过小（< img_size）
+    - 文件扩展名是否为常见图像格式
+
+    Returns:
+        {total, valid, corrupt, warnings, issues: [(path, reason), ...]}
+    """
+    data_path = Path(data_dir)
+    if not data_path.exists():
+        return {"total": 0, "valid": 0, "corrupt": 0, "warnings": [],
+                "issues": [(str(data_path), "Directory not found")]}
+
+    valid_extensions = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff"}
+
+    total = 0
+    valid = 0
+    corrupt = []
+    warnings = []
+
+    for ext in valid_extensions:
+        for img_path in data_path.rglob(f"*{ext}"):
+            # 跳过非文件（符号链接等）
+            if not img_path.is_file():
+                continue
+            total += 1
+
+            try:
+                with Image.open(img_path) as img:
+                    # 检查是否能正确加载
+                    img.verify()
+            except Exception:
+                # verify 后文件指针状态异常，需要重新打开
+                corrupt.append((str(img_path), "Corrupt file (cannot verify)"))
+                continue
+
+            try:
+                with Image.open(img_path) as img:
+                    mode = img.mode
+                    w, h = img.size
+
+                    if mode not in ("RGB", "RGBA", "L", "P", "CMYK"):
+                        warnings.append((str(img_path), f"Unusual mode: {mode}"))
+
+                    if w < img_size or h < img_size:
+                        warnings.append(
+                            (str(img_path), f"Small image: {w}x{h} (min: {img_size})")
+                        )
+
+                    if w < 10 or h < 10:
+                        corrupt.append((str(img_path), f"Tiny image: {w}x{h}"))
+                        continue
+
+                valid += 1
+
+            except Exception as e:
+                corrupt.append((str(img_path), f"Open error: {e}"))
+
+    # 汇总报告
+    report = {
+        "total": total,
+        "valid": valid,
+        "corrupt": len(corrupt),
+        "warnings": len(warnings),
+        "corrupt_files": corrupt[:50],    # 最多展示前 50 个
+        "warn_files": warnings[:50],
+    }
+
+    # 打印摘要
+    if total == 0:
+        print(f"[DATA] No images found in {data_dir}. Check the path.")
+    else:
+        status = "PASS" if len(corrupt) == 0 else f"WARN ({len(corrupt)} corrupt)"
+        print(f"[DATA] Scanned {total} images: {valid} valid, "
+              f"{len(corrupt)} corrupt, {len(warnings)} warnings — {status}")
+
+        if corrupt:
+            print(f"[DATA] Corrupt files (first 10):")
+            for path, reason in corrupt[:10]:
+                print(f"  - {path}\n    Reason: {reason}")
+            if len(corrupt) > 10:
+                print(f"  ... and {len(corrupt) - 10} more")
+
+        if warnings and not corrupt:
+            print(f"[DATA] Warnings (first 5):")
+            for path, reason in warnings[:5]:
+                print(f"  - {path}\n    Reason: {reason}")
+
+    return report
